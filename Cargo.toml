@@ -1,0 +1,8 @@
+[package]
+name = "rotate-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = {version = "0.4.19", default-features = false, features = ["clock"]}
+flate2 = "1.0"
