@@ -38,6 +38,10 @@
 //!    （Block 下 worker 死锁、DropNew 下错误日志挤占 channel）；应走
 //!    metrics / 告警旁路。回调 panic 已被库捕获（catch_unwind 防护，
 //!    不会终止 worker）。
+//! 6. **活跃文件被外部删除会自动重建**：运行期活跃文件（如 `logs/app.log`）被外部
+//!    删除时，下次轮转发现源文件缺失会直接重建活跃文件并继续写入（无物可归档，
+//!    故不产出归档、不上报错误），而非陷入 rename 失败的重试。删除前已写入但
+//!    未落盘的数据无法找回。
 
 mod channel;
 mod compress;

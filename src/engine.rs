@@ -221,6 +221,18 @@ impl Engine {
     }
 
     fn rotate_inner(&mut self) -> Result<(), Error> {
+        // ── 活跃文件缺失检测与重建（外部删除恢复）──
+        // 活跃文件可能被外部删除（日志目录被清理、运维手动 rm、容器挂载变化等）。
+        // 此时旧句柄指向已 unlink 的 inode：rename 的源不存在，轮转将永久失败
+        // （每次 write 重试仍 NotFound），后续写入也静默落入已删除 inode（数据丢失）。
+        // 文件已消失 = 无物可归档，直接重建活跃文件即可。
+        //
+        // 必须置于零字节跳过之前：空文件被删（current_size == 0）时，零字节跳过会
+        // 先返回而不重建，旧句柄将继续被使用。
+        if self.active_file_missing() {
+            return self.reopen_active().map_err(Error::Io);
+        }
+
         // ── 零字节跳过 ──
         // 活跃文件为空（应用空闲、无日志写入）时不产生归档：定时轮转在空闲期照常
         // 到点，若不跳过会把 0 字节文件反复归档成空文件（实测空闲 + 小间隔时同一秒
@@ -285,7 +297,13 @@ impl Engine {
 
         // ── 第三阶段：rename（失败时旧文件数据完好，继续写，下次重试） ──
         if let Err(e) = fs::rename(&self.active_path, &target) {
-            let _ = fs::remove_file(&target); // 清理占位空文件
+            let _ = fs::remove_file(&target); // 清理占位空文件（勿留 0 字节伪归档）
+            // TOCTOU：入口探测通过后、rename 之前源文件被外部删除。与入口探测同一
+            // 语义——无物可归档，直接重建活跃文件，而非把 NotFound 当作可重试错误
+            // （否则每次 write 重试都失败，形成永久 rotate-retry）。
+            if e.kind() == io::ErrorKind::NotFound && self.active_file_missing() {
+                return self.reopen_active().map_err(Error::Io);
+            }
             return Err(Error::Io(e));
         }
 
@@ -344,6 +362,37 @@ impl Engine {
     fn finish_rotation(&mut self) {
         self.last_rotation = Instant::now();
         self.last_rotation_error = None;
+    }
+
+    /// 活跃文件是否已从磁盘消失（外部删除探测）。
+    /// `try_exists` 的 `Err`（权限等）按"存在"处理：交回正常流程暴露真实错误，
+    /// 避免把"无法判断"误判为"已删除"而跳过归档、静默丢弃轮转。
+    fn active_file_missing(&self) -> bool {
+        !self.active_path.try_exists().unwrap_or(true)
+    }
+
+    /// 活跃文件被外部删除后的重建：丢弃失效句柄，按 `Engine::new` 的语义重新打开
+    /// （create + append，不 truncate 外部可能已重建的同名文件），并从 metadata
+    /// 恢复 `current_size`；最后推进轮转基准并清除失败标志，解除 write 路径重试。
+    ///
+    /// 不产生任何归档、不触发压缩/清理。失败时 `file` 保持 `None`，由 `rotate()`
+    /// 记录 `last_rotation_error` 驱动下次 write 重试（真实错误：权限/磁盘满等）。
+    fn reopen_active(&mut self) -> io::Result<()> {
+        // 先丢弃旧句柄：它指向已删除的 inode，继续持有只会把后续写入导向无处可寻的数据
+        self.file = None;
+        if let Some(parent) = self.active_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.active_path)?;
+        self.current_size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        self.file = Some(f);
+        self.finish_rotation();
+        Ok(())
     }
 
     /// 清理与补压（设计文档 §6.5）
