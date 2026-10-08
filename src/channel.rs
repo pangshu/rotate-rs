@@ -348,9 +348,11 @@ pub(crate) fn worker_loop(mut engine: Engine, rx: Receiver<Message>, shared: Arc
     // 声明顺序保证 drop 顺位在 rx/engine 之前：先置 closed，再断开 channel
     let _closed = ClosedOnDrop(Arc::clone(&shared));
     let interval = engine.interval();
+    // 定时基准与 should_rotate_now() 同源（last_rotation + interval），避免固定网格
+    // 推进导致的整周期跳过（详见 Engine::next_time_deadline）。
     // checked_add 防溢出（R5-2）：Duration::MAX 等极端 interval 会使加法 panic；
     // 溢出时 None = 不挂定时器（时间轮转停用、size 轮转照常），与"MAX ≈ 永不"意图一致
-    let mut next_deadline = interval.and_then(|d| Instant::now().checked_add(d));
+    let mut next_deadline = engine.next_time_deadline();
     loop {
         let msg = match next_deadline {
             Some(deadline) => {
@@ -380,12 +382,8 @@ pub(crate) fn worker_loop(mut engine: Engine, rx: Receiver<Message>, shared: Arc
                 if engine.should_rotate_by_size_now() {
                     match engine.rotate() {
                         Ok(()) => {
-                            // size 轮转后同步重置 deadline：保持与 last_rotation 的
-                            // 基准一致，避免时间轮转间隔被拉长（两套时钟必须同步）
-                            if let Some(iv) = interval {
-                                // R5-2：checked_add 溢出时停用时间轮转（同启动处语义）
-                                next_deadline = Instant::now().checked_add(iv);
-                            }
+                            // size 轮转同样推进了 last_rotation，定时基准同步重算
+                            next_deadline = engine.next_time_deadline();
                         }
                         Err(e) => engine.reporter().report("rotate", &e),
                     }
@@ -407,13 +405,21 @@ pub(crate) fn worker_loop(mut engine: Engine, rx: Receiver<Message>, shared: Arc
                 {
                     engine.reporter().report("rotate", &e);
                 }
-                // 关键：从旧 deadline 推进而非 rotate 完成时刻，消除累计漂移；
-                // 若处理耗时超过一个周期，快速补齐避免空转
-                if let (Some(deadline), Some(iv)) = (next_deadline.as_mut(), interval) {
-                    *deadline += iv;
-                    while *deadline <= Instant::now() {
-                        *deadline += iv;
-                    }
+                // 每次超时都按 last_rotation 重算基准：轮转成功（或被零字节跳过）都会
+                // 推进 last_rotation，下一个周期即 last_rotation + interval。沿用旧的
+                // "旧 deadline += interval" 会早于该时刻醒来 → elapsed < interval →
+                // 整周期被跳过（实测 interval=5s 时实际周期为 10s）。
+                if let Some(iv) = interval {
+                    let now = Instant::now();
+                    next_deadline = match engine.next_time_deadline() {
+                        // 正常：last_rotation 刚推进，基准落在未来
+                        Some(d) if d > now => Some(d),
+                        // 轮转失败（last_rotation 未推进）或基准已过期：从当前时刻
+                        // 推进一个周期兜底，避免立即再次超时形成空转
+                        Some(_) => now.checked_add(iv),
+                        // 溢出（Duration::MAX 等）：保持不挂定时器（同启动处语义）
+                        None => None,
+                    };
                 }
             }
             Err(RecvTimeoutError::Disconnected) => break,

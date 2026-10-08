@@ -171,6 +171,22 @@ impl Engine {
         self.rotation.interval()
     }
 
+    /// 下次时间轮转应触发的绝对时刻 = `last_rotation + interval`。
+    ///
+    /// 时间轮转的基准是"上次轮转完成时刻"（`finish_rotation` 置位；设计文档 §4.3
+    /// "从活跃文件创建/上次轮转起算，不对齐时钟边界"），因此定时器必须锚定它。
+    /// 若沿用固定网格推进（旧 deadline 反复 `+= interval`），醒来时刻会早于
+    /// `last_rotation + interval`，使 `should_rotate_now()` 因 `elapsed < interval`
+    /// 判为 false 而整周期被跳过 —— 实测 interval=5s 时实际周期为 10s。
+    ///
+    /// 轮转失败时 `last_rotation` 不推进，返回值可能已过期；调用方需按 interval
+    /// 兜底推进到未来，避免立即再次超时形成忙等（见 worker_loop 超时分支）。
+    pub(crate) fn next_time_deadline(&self) -> Option<Instant> {
+        self.rotation
+            .interval()
+            .and_then(|iv| self.last_rotation.checked_add(iv))
+    }
+
     /// 上次轮转是否失败（同步运行时 write 重试用）
     pub(crate) fn has_pending_rotation(&self) -> bool {
         self.last_rotation_error.is_some()
@@ -205,6 +221,19 @@ impl Engine {
     }
 
     fn rotate_inner(&mut self) -> Result<(), Error> {
+        // ── 零字节跳过 ──
+        // 活跃文件为空（应用空闲、无日志写入）时不产生归档：定时轮转在空闲期照常
+        // 到点，若不跳过会把 0 字节文件反复归档成空文件（实测空闲 + 小间隔时同一秒
+        // 就能产出 .1/.2/.3 多个空文件）。finish_rotation 重置时间基准，使下一个
+        // 周期从本次到点重新起算。
+        // `file.is_some()` 不可省：本函数兼作"上次轮转失败后的恢复重试"，file == None
+        // 表示 writer 不可用，必须继续走下方三级恢复链；若在此短路，finish_rotation
+        // 会清掉 last_rotation_error，令重试状态假性消失。
+        if self.current_size == 0 && self.file.is_some() {
+            self.finish_rotation();
+            return Ok(());
+        }
+
         // ── 第一阶段：固化旧文件（失败时状态不变，下次重试） ──
         if let Some(f) = &mut self.file {
             f.flush()?;
