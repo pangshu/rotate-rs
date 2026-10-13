@@ -1,5 +1,6 @@
 //! 命名模板引擎：编译、渲染、锚点解析、目录扫描排序（设计文档 §5）
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,9 @@ pub(crate) struct RotatedFile {
 #[derive(Debug, Clone)]
 pub(crate) struct Template {
     slots: Vec<Slot>,
+    /// "缺省 {counter}"形态的槽序列（`counter_optional_variant` 的产物），
+    /// 用于识别 `render(.., None)` 产出的无序号归档名；无 {counter} 模板为 None
+    slots_optional: Option<Vec<Slot>>,
     date_format: String,
 }
 
@@ -151,6 +155,7 @@ impl Template {
             return Err(Error::Template("模板必须包含 {date}".to_string()));
         }
         Ok(Template {
+            slots_optional: counter_optional_variant(&slots),
             slots,
             date_format: date_format.to_string(),
         })
@@ -165,19 +170,31 @@ impl Template {
         self.slots.contains(&Slot::Counter)
     }
 
-    /// 渲染：占位符替换（生成方向，设计文档 §5.5）
+    /// 渲染：占位符替换（生成方向，设计文档 §5.5）。
+    ///
+    /// `counter` 为 `None` 表示本次轮转不带序号段：`{counter}` 渲染为空，
+    /// 且若其紧邻的前一个槽位是 `{sep}`，该分隔符一并省略 —— 否则会渲染出
+    /// `app.<date>..log` 这样的双点名。解析侧的 `slots_optional` 是同一规则的
+    /// 逆运算（见 `counter_optional_variant`），二者必须同时存在。
     pub(crate) fn render(&self, known: &KnownValues, date: &str, counter: Option<u32>) -> PathBuf {
         let mut s = String::new();
-        for slot in &self.slots {
+        for (i, slot) in self.slots.iter().enumerate() {
             match slot {
                 Slot::Literal(t) => s.push_str(t),
                 Slot::Known(a) => s.push_str(known.value(*a)),
                 Slot::Date => s.push_str(date),
-                Slot::Counter => {
-                    if let Some(c) = counter {
-                        s.push_str(&c.to_string());
+                Slot::Counter => match counter {
+                    Some(c) => s.push_str(&c.to_string()),
+                    None => {
+                        if i > 0
+                            && self.slots[i - 1] == Slot::Known(Anchor::Sep)
+                            && !known.sep.is_empty()
+                            && s.ends_with(known.sep.as_str())
+                        {
+                            s.truncate(s.len() - known.sep.len());
+                        }
                     }
-                }
+                },
             }
         }
         // suffix 为空时省略末尾分隔符：模板多以 {sep}{suffix} 结尾，suffix 为空会
@@ -195,41 +212,28 @@ impl Template {
 
     /// 解析文件名：贪婪优先 + 回溯匹配（扫描方向，设计文档 §5.6）。
     /// 输入是目录内文件名（不含 {dir}/ 前缀），跳过头部 Dir 与路径分隔符字面量。
+    ///
+    /// 先按"带 {counter}"形态匹配（更具体，优先保证 `app.<date>.1.log` 的
+    /// date/counter 切分正确），失败再按"缺省 {counter}"形态匹配 —— 后者对应
+    /// `render(.., None)` 产出的 `app.<date>.log` 这类无序号归档名。
+    /// 缺了第二种形态，无序号归档会被本函数漏识别 → `scan_dir` 跳过 →
+    /// `max_backups` 清理与 `compress` 补压全部静默失效。
     pub(crate) fn parse(&self, known: &KnownValues, file_name: &str) -> Option<ParsedName> {
         // 0. 压缩标记
         let (name, compressed) = match file_name.strip_suffix(".gz") {
             Some(n) => (n, true),
             None => (file_name, false),
         };
-        // 1. 跳过头部 {dir} + "/" 槽位
-        let mut slots: &[Slot] = &self.slots;
-        if slots.first() == Some(&Slot::Known(Anchor::Dir)) {
-            slots = &slots[1..];
-        }
-        // 与编译规则 2.5 同一谓词
-        if let Some(Slot::Literal(t)) = slots.first()
-            && is_path_prefix(t)
-        {
-            slots = &slots[1..];
-        }
+        // 1. 跳过头部 {dir} + "/" 槽位（两种形态共用同一谓词，见 strip_head）
         // 2. 回溯匹配
-        let mut date = String::new();
-        let mut counter: Option<u32> = None;
-        let mut matched = self.backtrack(known, name, slots, 0, &mut date, &mut counter);
-        // 失败且 suffix 为空：补回末尾分隔符重试（对应 render 的省略逻辑；
-        // 同时兼容历史遗留的带尾分隔符文件）。backtrack 失败时不写入 date/counter，
-        // 故重试前无需重置
-        if !matched && known.suffix.is_empty() {
-            let with_sep = format!("{name}{}", known.sep);
-            matched = self.backtrack(known, &with_sep, slots, 0, &mut date, &mut counter);
-        }
-        if !matched {
-            return None;
-        }
-        // 3. 后置校验：date 非空且不含 ASCII 字母（date_format 默认为数字+分隔符）
-        if date.is_empty() || date.bytes().any(|b| b.is_ascii_alphabetic()) {
-            return None;
-        }
+        let (date, counter) = self
+            .match_slots(known, name, strip_head(&self.slots))
+            .or_else(|| {
+                self.slots_optional
+                    .as_deref()
+                    .and_then(|slots| self.match_slots(known, name, strip_head(slots)))
+            })?;
+        // 3. 组合 key（去重与排除刚轮转文件用）：无 counter 时即 date 本身
         let rotation_key = match counter {
             Some(c) => format!("{}{}{}", date, known.sep, c),
             None => date.clone(),
@@ -240,6 +244,35 @@ impl Template {
             counter,
             compressed,
         })
+    }
+
+    /// 用给定槽序列匹配文件名，返回 `(date, counter)`。
+    ///
+    /// 后置校验（date 非空且不含 ASCII 字母，date_format 默认为数字+分隔符）
+    /// 在此完成：不满足的匹配按失败处理，让调用方能继续尝试另一种形态。
+    fn match_slots(
+        &self,
+        known: &KnownValues,
+        name: &str,
+        slots: &[Slot],
+    ) -> Option<(String, Option<u32>)> {
+        let mut candidates: Vec<Cow<'_, str>> = vec![Cow::Borrowed(name)];
+        // suffix 为空：补回末尾分隔符重试（对应 render 的省略逻辑；
+        // 同时兼容历史遗留的带尾分隔符文件）
+        if known.suffix.is_empty() {
+            candidates.push(Cow::Owned(format!("{name}{}", known.sep)));
+        }
+        for cand in candidates {
+            let mut date = String::new();
+            let mut counter: Option<u32> = None;
+            if self.backtrack(known, &cand, slots, 0, &mut date, &mut counter)
+                && !date.is_empty()
+                && !date.bytes().any(|b| b.is_ascii_alphabetic())
+            {
+                return Some((date, counter));
+            }
+        }
+        None
     }
 
     /// 回溯匹配：贪婪优先（Date / Counter 均从长到短枚举分割点）
@@ -307,6 +340,38 @@ impl Template {
 /// 保证渲染出的路径能被原样解析回来
 fn is_path_prefix(text: &str) -> bool {
     text.starts_with('/') || text.starts_with('\\')
+}
+
+/// 跳过槽序列头部的 `{dir}` 与紧随其后的路径分隔符字面量。
+/// 解析的两种形态（带 / 不带 {counter}）共用，保证两侧跳过逻辑一致。
+fn strip_head(slots: &[Slot]) -> &[Slot] {
+    let mut s = slots;
+    if s.first() == Some(&Slot::Known(Anchor::Dir)) {
+        s = &s[1..];
+    }
+    if let Some(Slot::Literal(t)) = s.first()
+        && is_path_prefix(t)
+    {
+        s = &s[1..];
+    }
+    s
+}
+
+/// 构造"缺省 {counter}"形态的槽序列：移除首个 `{counter}` 槽；若其紧邻的
+/// 前一个槽位是 `{sep}`，一并移除。与 `render` 中 `counter == None` 时的省略
+/// 规则成对（缺一侧就会出现"渲染出的名字解析不回来"的静默失效）。
+/// 模板不含 `{counter}` 时返回 `None`。
+fn counter_optional_variant(slots: &[Slot]) -> Option<Vec<Slot>> {
+    let idx = slots.iter().position(|s| *s == Slot::Counter)?;
+    let sep_idx = (idx > 0 && slots[idx - 1] == Slot::Known(Anchor::Sep)).then(|| idx - 1);
+    Some(
+        slots
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx && Some(*i) != sep_idx)
+            .map(|(_, s)| s.clone())
+            .collect(),
+    )
 }
 
 /// 相邻字面量合并
@@ -408,4 +473,125 @@ pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
         }
     }
     (x.len() - i).cmp(&(y.len() - j))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEFAULT_TPL: &str = "{dir}/{name}{sep}{date}{sep}{counter}{sep}{suffix}";
+    const DATE: &str = "2026-10-11-14-15-03";
+
+    fn known() -> KnownValues {
+        KnownValues {
+            dir: "logs".to_string(),
+            name: "app".to_string(),
+            sep: ".".to_string(),
+            suffix: "log".to_string(),
+        }
+    }
+
+    fn tpl(template: &str) -> Template {
+        Template::compile(template, "%Y-%m-%d-%H-%M-%S").unwrap()
+    }
+
+    /// counter 为 None 时：序号段连同其前的 {sep} 一并省略，不得出现双点
+    #[test]
+    fn render_without_counter_omits_sep_and_counter() {
+        let (k, t) = (known(), tpl(DEFAULT_TPL));
+        assert_eq!(
+            t.render(&k, DATE, None),
+            PathBuf::from("logs/app.2026-10-11-14-15-03.log")
+        );
+        assert_eq!(
+            t.render(&k, DATE, Some(1)),
+            PathBuf::from("logs/app.2026-10-11-14-15-03.1.log")
+        );
+    }
+
+    /// 无序号归档名必须能被解析回来（否则 scan_dir 跳过 → 清理/压缩静默失效）
+    #[test]
+    fn parse_recognizes_both_forms() {
+        let (k, t) = (known(), tpl(DEFAULT_TPL));
+
+        let plain = t.parse(&k, "app.2026-10-11-14-15-03.log").unwrap();
+        assert_eq!(plain.date, DATE);
+        assert_eq!(plain.counter, None);
+        assert_eq!(plain.rotation_key, DATE);
+
+        let numbered = t.parse(&k, "app.2026-10-11-14-15-03.1.log").unwrap();
+        assert_eq!(numbered.date, DATE);
+        assert_eq!(numbered.counter, Some(1));
+        assert_eq!(numbered.rotation_key, "2026-10-11-14-15-03.1");
+
+        let gz = t.parse(&k, "app.2026-10-11-14-15-03.log.gz").unwrap();
+        assert!(gz.compressed);
+        assert_eq!(gz.counter, None);
+    }
+
+    /// 渲染 → 解析 → 再渲染 应完全稳定（无序号 / 有序号 / 多位数序号）
+    #[test]
+    fn render_parse_round_trip_is_stable() {
+        let (k, t) = (known(), tpl(DEFAULT_TPL));
+        for counter in [None, Some(1), Some(7), Some(123)] {
+            let path = t.render(&k, DATE, counter);
+            let file_name = path.file_name().unwrap().to_str().unwrap();
+            let parsed = t.parse(&k, file_name).unwrap();
+            assert_eq!(parsed.counter, counter, "counter 往返不一致: {file_name}");
+            assert_eq!(parsed.date, DATE);
+            assert_eq!(t.render(&k, &parsed.date, parsed.counter), path);
+        }
+    }
+
+    /// 非本库管理的文件不得被误识别
+    #[test]
+    fn unrelated_files_are_rejected() {
+        let (k, t) = (known(), tpl(DEFAULT_TPL));
+        assert!(t.parse(&k, "app.log").is_none());
+        assert!(t.parse(&k, "other.2026-10-11-14-15-03.log").is_none());
+        assert!(t.parse(&k, "app.2026-10-11-14-15-03.txt").is_none());
+    }
+
+    /// 模板不含 {counter}：没有"缺省形态"，渲染结果与无序号形态一致
+    #[test]
+    fn template_without_counter_has_no_optional_variant() {
+        let (k, t) = (known(), tpl("{dir}/{name}{sep}{date}{sep}{suffix}"));
+        assert!(!t.has_counter());
+        assert!(t.slots_optional.is_none());
+        assert_eq!(
+            t.render(&k, DATE, None),
+            PathBuf::from("logs/app.2026-10-11-14-15-03.log")
+        );
+        assert!(t.parse(&k, "app.2026-10-11-14-15-03.log").is_some());
+    }
+
+    /// suffix 为空：省略尾分隔符，且无序号形态仍能往返
+    #[test]
+    fn empty_suffix_round_trips_without_counter() {
+        let k = KnownValues {
+            suffix: String::new(),
+            ..known()
+        };
+        let t = tpl(DEFAULT_TPL);
+        let path = t.render(&k, DATE, None);
+        assert_eq!(path, PathBuf::from("logs/app.2026-10-11-14-15-03"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let parsed = t.parse(&k, file_name).unwrap();
+        assert_eq!(parsed.counter, None);
+        assert_eq!(parsed.date, DATE);
+    }
+
+    /// {counter} 前的槽位不是 {sep}（如字面量）时只省略 counter 本身，
+    /// 且该形态同样可被解析回来
+    #[test]
+    fn literal_before_counter_is_kept_and_parseable() {
+        let template = "{dir}/{name}{sep}{date}_{counter}{sep}{suffix}";
+        let (k, t) = (known(), tpl(template));
+        let path = t.render(&k, DATE, None);
+        assert_eq!(path, PathBuf::from("logs/app.2026-10-11-14-15-03_.log"));
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+        let parsed = t.parse(&k, file_name).unwrap();
+        assert_eq!(parsed.counter, None);
+        assert_eq!(parsed.date, DATE);
+    }
 }

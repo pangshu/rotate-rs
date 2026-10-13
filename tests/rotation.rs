@@ -155,3 +155,80 @@ fn rotation_still_works_after_recovery() {
     assert_eq!(files.len(), 1, "恢复后应能正常产出归档，实际: {files:?}");
     drop(writer);
 }
+
+// ── 归档命名：序号是"重名去重后缀"，不是"归档序号" ──────────────
+
+/// Size 阈值 1 字节 + 分钟精度 date 的同步配置：
+/// 每次 write 都触发轮转，且同一分钟内多次轮转必然落在同一个 date 上
+/// （确定性构造"同秒重名"，不依赖时钟边界）。
+fn cfg_sync_size_minute(dir: &Path, max_backups: Option<usize>) -> Config {
+    Config {
+        dir: dir.to_string_lossy().into_owned(),
+        date_format: "%Y-%m-%d-%H-%M".to_string(),
+        rotation: Rotation::Size(1),
+        max_backups,
+        mode: Mode::Sync,
+        ..Default::default()
+    }
+}
+
+/// 无同名冲突时归档名**不带**序号；同一 date 内第二次轮转才补 `.1`。
+#[test]
+fn archive_name_has_no_counter_until_collision() {
+    let dir = tmp_dir("counter-optional");
+    let mut writer = open(cfg_sync_size_minute(&dir, None)).unwrap();
+
+    writer.write_all(b"a").unwrap(); // size 0 -> 1，未达阈值，不轮转
+    writer.write_all(b"b").unwrap(); // 第 1 次轮转：无同名 -> 不带序号
+    writer.write_all(b"c").unwrap(); // 第 2 次轮转：同 date 重名 -> 补 .1
+    writer.flush().unwrap();
+    drop(writer);
+
+    let files = archives(&dir);
+    assert_eq!(files.len(), 2, "应产出 2 个归档，实际: {files:?}");
+
+    let plain = files
+        .iter()
+        .find(|n| !n.ends_with(".1.log"))
+        .unwrap_or_else(|| panic!("应有一个不带序号的归档，实际: {files:?}"));
+    let numbered = files
+        .iter()
+        .find(|n| n.ends_with(".1.log"))
+        .unwrap_or_else(|| panic!("重名归档应带 .1，实际: {files:?}"));
+
+    assert_eq!(
+        numbered,
+        &format!("{}.1.log", plain.strip_suffix(".log").unwrap()),
+        "重名归档应为无序号归档名 + .1"
+    );
+    assert!(
+        plain.ends_with(".log") && !plain.contains(".1."),
+        "首个归档不应带序号，实际: {plain}"
+    );
+}
+
+/// 回归守卫：无序号归档名必须能被扫描识别，否则 max_backups 清理会静默失效。
+/// 同一分钟内 3 次轮转产出 `date` / `date.1` / `date.2`，max_backups=2 应删掉最旧的。
+#[test]
+fn max_backups_cleans_counterless_archives() {
+    let dir = tmp_dir("counter-optional-cleanup");
+    let mut writer = open(cfg_sync_size_minute(&dir, Some(2))).unwrap();
+
+    writer.write_all(b"a").unwrap(); // size 0 -> 1
+    writer.write_all(b"b").unwrap(); // 轮转 #1 -> app.<date>.log
+    writer.write_all(b"c").unwrap(); // 轮转 #2 -> app.<date>.1.log
+    writer.write_all(b"d").unwrap(); // 轮转 #3 -> app.<date>.2.log，并触发清理
+    writer.flush().unwrap();
+    drop(writer);
+
+    let files = archives(&dir);
+    assert_eq!(
+        files.len(),
+        2,
+        "max_backups=2 应只保留 2 个归档（最旧的应被删除），实际: {files:?}"
+    );
+    assert!(
+        files.iter().any(|n| n.ends_with(".1.log")) && files.iter().any(|n| n.ends_with(".2.log")),
+        "应保留最新的两个（.1 与 .2），实际: {files:?}"
+    );
+}

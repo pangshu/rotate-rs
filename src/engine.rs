@@ -258,20 +258,18 @@ impl Engine {
             .format(self.template.date_format())
             .to_string();
         let has_counter = self.template.has_counter();
-        let mut counter: u32 = 1;
+        // 候选序列：None（不带序号）→ Some(1) → Some(2) …
+        // 无同名冲突时归档名就是 {name}{sep}{date}{sep}{suffix}（如
+        // logs/app.2026-10-11-14-15-03.log）；只有同一 date 内发生第二次及以上
+        // 轮转（同秒重名）才会带上 .1/.2 序号。序号是"去重后缀"，不是"归档序号"。
+        let mut counter: Option<u32> = None;
         let target = loop {
-            if counter > MAX_ROTATION_CANDIDATES {
+            if counter.is_some_and(|c| c > MAX_ROTATION_CANDIDATES) {
                 return Err(Error::Io(io::Error::other(
                     "轮转命名冲突探测超过 100000 次",
                 )));
             }
-            // 无 counter 模板：counter 递增不改变渲染结果，同 date 冲突直接失败（规则 5）
-            if counter > 1 && !has_counter {
-                return Err(Error::Io(io::Error::other(
-                    "模板无 {counter}，同 date 轮转目标名冲突",
-                )));
-            }
-            let candidate = self.template.render(&self.known, &date, Some(counter));
+            let candidate = self.template.render(&self.known, &date, counter);
             match OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -283,17 +281,18 @@ impl Engine {
                     if gz_path(&candidate).exists() {
                         drop(placeholder);
                         let _ = fs::remove_file(&candidate); // 清理本次占位
-                        counter += 1;
+                        counter = next_counter(counter, has_counter)?;
                         continue;
                     }
-                    break candidate; // 原子占位成功，目标名唯一（.log 与 .gz 均不存在）
+                    break (candidate, counter); // 原子占位成功，目标名唯一（.log 与 .gz 均不存在）
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    counter += 1; // 同 date 冲突，递增重试
+                    counter = next_counter(counter, has_counter)?; // 同 date 冲突，递增重试
                 }
                 Err(e) => return Err(Error::Io(e)), // 权限等真实错误，直接失败
             }
         };
+        let (target, counter) = target;
 
         // ── 第三阶段：rename（失败时旧文件数据完好，继续写，下次重试） ──
         if let Err(e) = fs::rename(&self.active_path, &target) {
@@ -309,10 +308,10 @@ impl Engine {
 
         // ── 第四阶段：状态推进 ──
         self.file = None; // 丢弃旧句柄
-        self.last_rotation_key = Some(if has_counter {
-            format!("{}{}{}", date, self.known.sep, counter)
-        } else {
-            date
+        // rotation_key 必须与 naming::parse 的组合规则一致（去重与 scan 排除用）
+        self.last_rotation_key = Some(match counter {
+            Some(c) => format!("{}{}{}", date, self.known.sep, c),
+            None => date,
         });
         if self.compression {
             self.enqueue_compress(target.clone());
@@ -459,6 +458,20 @@ impl Engine {
         if let Err(e) = compress_file(path) {
             self.reporter.report("compress", &Error::Compress(e));
         }
+    }
+}
+
+/// 轮转候选名序号推进：`None`（无序号）→ `Some(1)` → `Some(2)` …
+///
+/// 模板不含 `{counter}` 时，`None` 之后无法再生成不同名字，同 date 冲突直接失败
+/// （设计文档 §5.4 规则 5）。`MAX_ROTATION_CANDIDATES` 的上限保护在调用处。
+fn next_counter(counter: Option<u32>, has_counter: bool) -> Result<Option<u32>, Error> {
+    match counter {
+        None if has_counter => Ok(Some(1)),
+        None => Err(Error::Io(io::Error::other(
+            "模板无 {counter}，同 date 轮转目标名冲突",
+        ))),
+        Some(n) => Ok(Some(n + 1)),
     }
 }
 

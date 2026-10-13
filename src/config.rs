@@ -20,6 +20,10 @@ pub(crate) const DEFAULT_SEP: &str = ".";
 /// 默认日期格式
 pub(crate) const DEFAULT_DATE_FORMAT: &str = "%Y-%m-%d-%H-%M-%S";
 /// 默认命名模板
+///
+/// `{counter}` 是**重名去重后缀**而非"归档序号"：正常轮转（同 date 内首次）
+/// 不带序号段（渲染为 `logs/app.<date>.log`），只有同一 date 内发生第二次及
+/// 以上轮转（同秒重名）才补 `.1` / `.2`…。详见 `naming` 模块。
 pub(crate) const DEFAULT_TEMPLATE: &str = "{dir}/{name}{sep}{date}{sep}{counter}{sep}{suffix}";
 /// Hybrid 策略默认大小分量（100 MB）
 pub(crate) const DEFAULT_MAX_SIZE: usize = 100 * 1024 * 1024;
@@ -57,7 +61,9 @@ pub struct Config {
     pub sep: String,
     /// {date} 的时间格式（chrono 本地时区）
     pub date_format: String,
-    /// 轮转文件命名模板，见设计文档 §5
+    /// 轮转文件命名模板，见设计文档 §5。
+    /// `{counter}` 为可选段：同 date 首次轮转省略（连同其前的 `{sep}`），
+    /// 仅在重名时依次补 `.1` / `.2`…
     pub template: String,
 
     // ── 轮转策略 ──
